@@ -46,6 +46,53 @@ trap 到 **VS-mode**，`vsstatus.SPP` 依照下表设置：
 
 `hstatus`, `sstatus` 不修改，V=1；写 `vsstatus.PIE`, `vsstatus.SPIE` 和 CSR `vsepc`, `vscause`, `vstval`。
 
+### 内存虚拟化
+
+#### XATP
+
+处于X特权级下的地址转换与保护控制状态寄存器。
+
+SATP用于控制S-mode下地址转换与保护
+
+| Field Name | Width (32) | Range (32) | Width (64) | Range (64) | Function                                                     |
+| :--------- | :--------- | :--------- | :--------- | :--------- | :----------------------------------------------------------- |
+| MODE       | 1          | 31         | 4          | 63:60      | selects the address-translation scheme                       |
+| ASID       | 9          | 30:22      | 16         | 59:44      | **address space identifier**, which facilitates address-translation fences on a per-address-space basis |
+| PPN        | 22         | 21:0       | 44         | 43:0       | hold the **page table number** of the root page table, i.e., its supervisor physical address divided by 4 KiB |
+
+Mode位用于标记当前系统使用的内存模式
+
+![](./images/satp-mode.png)
+
+`satp`的值在`S-Mode U-mode`有效
+
+`hatp`的`VMID`位进行了两位的拓展， 留出两位后剩下的用于保存`Virtual Machine Identifier`
+
+![](./images/hgatp.png)
+
+V=1 时，`vsatp` 将取代 `satp`，所有对 `satp` 的操作（读写）将在 `vsatp` 上完成。`vsatp` 将用于 VS-Stage 的地址转换。
+
+仅当处于 U 特权模式且 `hstatus.HU=0` 时，`vsatp` 才被视作无效状态。
+
+### 两阶段地址转换
+
+虚拟机里的虚拟地址访问需要经历`VS`和`G`两个阶段的转换， 分别由`vsatp`和`hgatp`控制， 由original virtual address, VA --> guest physical address, GPA -> supervisor physical address, SPA, 分别记为`VS-Stage`和`G-Stage`
+
+SPA可以认为是被hypervisor管理的物理地址(Hypervisor Physical Address), SPA是ISA的说法， 反正意思就是最终的转换结果， 可以认为是实际的物理地址
+
+当V = 1时， 两段地址转换视为生效状态， 绕过地址转换的访问将只与`G-Stage`有关（比如说只对VS级的页表进行读写的操作）
+
+VS-Stage的地址转换和S-Mode下的大致相同， 但是会从`vsatp`处获得根页表地址
+
+G-Stage的转换由hgatp控制， 不同之处在该阶段的虚拟地址相较于原有的地址转换需要扩宽两位， 称为是Sv32x4, Sv39x4, Sv48x4，和 Sv57x4 转换机制。与之对应的根页表的大小也随之扩大至 16 KiB 而非原来的 4 KiB，但其它各级页表的大小保持不变。根页表也需要与 16 KiB 的页边界对齐。
+
+以及以下的不同：
+
+- `hgatp` 代替 `satp` 用于获取根页表的 PPN。
+- 这一阶段翻译的起始特权级应该 VU 或 VS，即处于虚拟态，V=1。
+- 当进行 PTE.U（页表项中表示是否可被 U-Mode 程序访问）的访问时，特权级会变为 U-Mode，即所有的内存访问都被视为 U-Mode 的访问。
+- 出现异常时将会是 `guest-page-fault exceptions` 而非 `page-fault exceptions`。
+
 
 
 ## 练习1
@@ -282,3 +329,34 @@ M模式下
 当在HS-mode处理时， 设置V = 0, 然后如表设置`hstatus.SPV and sstatus.SPP`, 如果`trap`前V = 1, `hstatus.SPVP = sstatus.SPP`, ，否则不变。 也会写入`htatus.GVA, sstatus.SPIE&SIE`, `spec, scause, stval, htval`
 
 当在VS-mode处理时， 设置`vsstatus.SPP`, 不改变`hstatus sstatus`和V, 修改`vsstatus.SPIE&SIE`和`vsepc, vscause, vstval`
+
+### 练习4
+
+三级页表 -> 二级页表 -> 一级页表， 三次访存查询到guest physical address, 然后再获取到真实地址一共3 + 3 = 6次....吗？
+
+然而我觉得没有这么简单。 要获得下一级页表的地址， 必须要切实地去查页表， 而要查也就是说要获取到页表的真实物理地址才行。
+
+每一次访问页表查出下一级页表的地址都是这样的流程：
+
+已有地址 -> 二级虚拟地址 -> 真实地址 -> 取出下一级页表的虚拟地址
+
+也就是说每一次查下一级页表的地址都需要三次访存从真实地址中取出下一级页表的虚拟地址...
+
+这样完成一次转换起码就得15次访存
+
+```
+GVA             -------> GL3  -------> GL2 --------> GL1
+|               |         |   |         |             |
+---------> MMU --------> MMU --------> MMU --------> MMU
+			|   |         |   |         |   |         |
+			L3  |         L3  |         L3  |         L3
+			|   |         |   |         |   |         |
+			L2  |         L2  |         L2  |         L2
+			|   |         |   |         |   |         |
+			L1  |         L1  |         L1  |         L1
+			|   |         |   |         |   |         |
+			-----         -----         -----         HPA
+			                                          |
+			                                          (Content)
+```
+
